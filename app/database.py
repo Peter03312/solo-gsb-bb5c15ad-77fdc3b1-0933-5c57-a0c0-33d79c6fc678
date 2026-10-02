@@ -61,6 +61,17 @@ CREATE TABLE IF NOT EXISTS batch_confirmations (
     result          TEXT NOT NULL,                          -- 首次成功结果 JSON（各行程号等）
     confirmed_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 航段分时航时管制：半开分钟区间 [start_minute, end_minute) 内进入航段的
+-- 船舶按 travel_time 计航时；未命中任何区间沿用 segments.travel_time 基础航时。
+-- 整组替换（同 seg_id 先全删再插），区间互不交叠由服务层保证。
+CREATE TABLE IF NOT EXISTS segment_travel_controls (
+    seg_id        INTEGER NOT NULL REFERENCES segments(seg_id),
+    start_minute  INTEGER NOT NULL CHECK (start_minute >= 0),
+    end_minute    INTEGER NOT NULL CHECK (end_minute > start_minute),  -- 半开区间止（不含）
+    travel_time   INTEGER NOT NULL CHECK (travel_time > 0),            -- 管制通行分钟（正整数）
+    PRIMARY KEY (seg_id, start_minute)
+);
 """
 
 

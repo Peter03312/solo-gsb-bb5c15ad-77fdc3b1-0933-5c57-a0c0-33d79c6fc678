@@ -24,12 +24,16 @@ from .schemas import (
     RevisionOut,
     SegmentIn,
     SegmentOut,
+    TravelControlListOut,
+    TravelControlOut,
+    TravelControlReplaceRequest,
     TideCorrection,
     TideErrorRevision,
     TripOut,
     TripReviewOut,
 )
 from .services.batch import confirm_batch, plan_batch
+from .services.controls import load_controls, replace_segment_controls
 from .services.planning import find_itinerary, load_occupancy
 from .services.reschedule import review_and_reschedule
 
@@ -132,6 +136,55 @@ def list_segments():
             " FROM segments ORDER BY seg_id"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---- 航段分时航时管制 -------------------------------------------------------------
+
+def _control_list_out(conn, seg_id: int) -> TravelControlListOut:
+    row = conn.execute(
+        "SELECT seg_id, travel_time AS base_travel_time FROM segments"
+        " WHERE seg_id = ?",
+        (seg_id,),
+    ).fetchone()
+    if row is None:
+        raise ApiError(404, "SEGMENT_NOT_FOUND", f"未知航段: {seg_id}",
+                       {"seg_id": seg_id})
+    intervals = load_controls(conn, [seg_id]).get(seg_id, [])
+    return TravelControlListOut(
+        seg_id=seg_id,
+        base_travel_time=row["base_travel_time"],
+        controls=[
+            TravelControlOut(start_minute=s, end_minute=e, travel_time=t)
+            for s, e, t in intervals
+        ],
+    )
+
+
+@app.put("/api/segments/{seg_id}/travel-controls",
+         response_model=TravelControlListOut, tags=["segments"])
+def replace_travel_controls(seg_id: int, body: TravelControlReplaceRequest):
+    """以航段编号整组替换分时航时管制，返回替换后的生效清单。
+
+    每个元素为半开分钟区间 [start_minute, end_minute) 及正整数通行分钟；
+    船舶于进入分钟命中区间即按该通行分钟计航时（途中跨边界不变），未命中
+    沿用航段基础航时。空组恢复基础航时。未知航段 404 SEGMENT_NOT_FOUND；
+    非法区间 422 INVALID_CONTROL_INTERVAL；组内交叠
+    422 OVERLAPPING_CONTROL_INTERVAL，任一失败均保留旧管制不变。
+    """
+    with get_conn() as conn:
+        replace_segment_controls(
+            conn, seg_id, [c.model_dump() for c in body.controls]
+        )
+        out = _control_list_out(conn, seg_id)
+    return out
+
+
+@app.get("/api/segments/{seg_id}/travel-controls",
+         response_model=TravelControlListOut, tags=["segments"])
+def get_travel_controls(seg_id: int):
+    """读取航段当前生效的分时航时管制清单（按起点升序）。"""
+    with get_conn() as conn:
+        return _control_list_out(conn, seg_id)
 
 
 # ---- 潮位修订 --------------------------------------------------------------------

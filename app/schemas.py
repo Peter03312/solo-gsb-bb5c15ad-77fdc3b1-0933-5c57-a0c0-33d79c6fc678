@@ -37,6 +37,35 @@ class SegmentOut(BaseModel):
     clearance: Optional[float] = None
 
 
+# ---- 航段分时航时管制 -------------------------------------------------------------
+
+class TravelControlIn(BaseModel):
+    # 合法性（start>=0、end>start、travel_time>0）由服务层统一校验并返回
+    # INVALID_CONTROL_INTERVAL，保证非法区间只有一个拒绝口径
+    start_minute: int = Field(description="管制半开区间起点（含），绝对分钟，>=0")
+    end_minute: int = Field(description="管制半开区间止点（不含），必须 > start_minute")
+    travel_time: int = Field(description="该区间内进入航段的通行分钟（正整数）")
+
+
+class TravelControlReplaceRequest(BaseModel):
+    controls: list[TravelControlIn] = Field(
+        description="整组替换的半开分钟区间清单（空组恢复航段基础航时）；"
+                    "组内区间不得交叠"
+    )
+
+
+class TravelControlOut(TravelControlIn):
+    pass
+
+
+class TravelControlListOut(BaseModel):
+    seg_id: int = Field(description="航段编号")
+    base_travel_time: int = Field(description="航段基础航时（未命中管制区间时使用）")
+    controls: list[TravelControlOut] = Field(
+        description="当前生效的分时管制清单（按起点升序）；空列表表示全程基础航时"
+    )
+
+
 # ---- 潮位 ----------------------------------------------------------------------
 
 class TideCorrection(BaseModel):

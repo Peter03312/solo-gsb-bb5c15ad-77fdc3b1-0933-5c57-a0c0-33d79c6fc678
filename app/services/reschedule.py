@@ -34,6 +34,7 @@ from typing import Optional
 
 from .. import config
 from ..errors import ApiError, tide_missing, trip_not_found
+from .controls import effective_travel_time, load_controls
 from .planning import (
     Segment,
     _build_departure_feasible,
@@ -124,10 +125,14 @@ def review_and_reschedule(
 
     # 6) 不安全：在相同航段序列/参数/窗口下求改期行程。
     #    占用须避开其他已确认快照，但排除本快照自身（建议不占位）。
+    #    改期按**当前分时航时管制**求解（已确认快照的既有占用时长不随管制变化，
+    #    但新行程各段航时以进入分钟当前管制计）。
     blocked = load_occupancy(conn, start, horizon - 1,
                              exclude_trip_id=snap["trip_id"])
+    controls = load_controls(conn, [leg["seg_id"] for leg in legs])
     resched = _reschedule(
-        legs, segs, tide, start, window, draft, height, margin, revision, blocked
+        legs, segs, tide, start, window, draft, height, margin, revision,
+        blocked, controls,
     )
     if resched is None:
         result["no_solution"] = True
@@ -201,12 +206,13 @@ def _check_original(legs, segs, tide, draft, height, margin) -> Optional[dict]:
 
 def _reschedule(
     legs, segs, tide, start, window, draft, height, margin, revision,
-    blocked=None,
+    blocked=None, controls=None,
 ) -> Optional[dict]:
     """固定航段序列的时间展开 DP，返回最优改期或 None。
 
     blocked 为须避开的其他已确认快照占用 {seg_id: {绝对分钟}}（本快照
-    自身已排除）。
+    自身已排除）；controls 为当前分时航时管制，各段航时以**出发分钟**
+    当时管制计（未命中区间用航段基础航时）。
     """
     k = len(legs)
     if k == 0:
@@ -215,9 +221,11 @@ def _reschedule(
     used = [segs[leg["seg_id"]] for leg in legs]
     original_deps = [leg["start_minute"] for leg in legs]
 
-    # 每个（快照序中的）航段在各进入分钟是否全程可行（潮位误差带 + 占用）
-    feasible = _build_departure_feasible(
-        used, tide, start, window, draft, height, margin, blocked=blocked
+    # 每个（快照序中的）航段在各进入分钟是否全程可行（潮位误差带 + 占用），
+    # 以及于该分钟进入时的实际航时（当前分时管制）
+    feasible, travel_at = _build_departure_feasible(
+        used, tide, start, window, draft, height, margin,
+        blocked=blocked, controls=controls,
     )
 
     n = window
@@ -228,23 +236,29 @@ def _reschedule(
 
     for i in range(k):
         seg = used[i]
-        tt = seg.travel_time
+        tt_arr = travel_at[seg.seg_id]
         cur = states[i]
         nxt = states[i + 1]
 
         # 按分钟递增维护「抵达分钟 <= 当前出发分钟」的最优前缀
         best_key = None  # (changes, departures)
-        for d in range(0, n - tt + 1):
+        for d in range(0, n + 1):
             if d in cur:
                 cand = cur[d]
                 if best_key is None or cand < best_key:
                     best_key = cand
-            if best_key is None or not feasible[seg.seg_id][d]:
+            if best_key is None:
+                continue
+            t = tt_arr[d]
+            if d + t > n or not feasible[seg.seg_id][d]:
                 continue
             changes, deps = best_key
             new_changes = changes + (1 if start + d != original_deps[i] else 0)
-            # 同一 (i+1, 抵达分钟) 只会从一个最优前缀产生，直接落盘
-            nxt[d + tt] = (new_changes, deps + (start + d,))
+            key = (new_changes, deps + (start + d,))
+            # 分时航时下不同出发分钟可能同分钟抵达：同一抵达状态只保留最优代价
+            old = nxt.get(d + t)
+            if old is None or key < old:
+                nxt[d + t] = key
 
     if not states[k]:
         return None
@@ -259,16 +273,19 @@ def _reschedule(
     itinerary = []
     for i, seg in enumerate(used):
         d = deps[i]
+        t = effective_travel_time(
+            seg.travel_time, controls.get(seg.seg_id, ()), d
+        ) if controls else seg.travel_time
         itinerary.append({
             "seg_id": seg.seg_id,
             "origin": seg.origin,
             "destination": seg.destination,
             "start_minute": d,
-            "end_minute": d + seg.travel_time,
-            "travel_time": seg.travel_time,
+            "end_minute": d + t,
+            "travel_time": t,
         })
 
-    sailing = sum(seg.travel_time for seg in used)
+    sailing = sum(leg["travel_time"] for leg in itinerary)
     changed = [
         {"leg_index": i, "seg_id": used[i].seg_id,
          "original_departure_minute": original_deps[i],
