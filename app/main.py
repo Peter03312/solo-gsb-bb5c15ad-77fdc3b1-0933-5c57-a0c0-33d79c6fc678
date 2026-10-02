@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from . import config
 from .database import get_conn, init_db
-from .errors import ApiError
+from .errors import ApiError, unknown_segment
 from .schemas import (
     BatchConfirmRequest,
     BatchConfirmResponse,
@@ -22,6 +22,9 @@ from .schemas import (
     PlanResponse,
     ReviewRequest,
     RevisionOut,
+    SegmentControlsIn,
+    SegmentControlsOut,
+    ControlWindowOut,
     SegmentIn,
     SegmentOut,
     TideCorrection,
@@ -132,6 +135,103 @@ def list_segments():
             " FROM segments ORDER BY seg_id"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---- 航段分时航时管制 --------------------------------------------------------------
+
+def _segment_controls_out(conn, seg_id: int) -> SegmentControlsOut:
+    """读取某航段当前生效的管制清单（未知航段抛 SEGMENT_NOT_FOUND）。"""
+    seg = conn.execute(
+        "SELECT seg_id, origin, destination, travel_time FROM segments"
+        " WHERE seg_id = ?",
+        (seg_id,),
+    ).fetchone()
+    if seg is None:
+        raise unknown_segment(seg_id)
+    rows = conn.execute(
+        "SELECT start_minute, end_minute, travel_time FROM segment_controls"
+        " WHERE seg_id = ? ORDER BY start_minute",
+        (seg_id,),
+    ).fetchall()
+    return SegmentControlsOut(
+        seg_id=seg["seg_id"],
+        origin=seg["origin"],
+        destination=seg["destination"],
+        base_travel_time=seg["travel_time"],
+        controls=[dict(r) for r in rows],
+    )
+
+
+@app.put("/api/segments/{seg_id}/controls",
+         response_model=SegmentControlsOut, tags=["segments", "controls"])
+def put_segment_controls(seg_id: int, body: SegmentControlsIn):
+    """整组替换某航段的分时航时管制，并返回生效清单。
+
+    - 区间为半开 [起, 止)，通行分钟须为正整数；空组表示恢复基础航时；
+    - 未知航段 404 SEGMENT_NOT_FOUND；非法区间 422 VALIDATION_ERROR；
+      组内重叠 422 CONTROL_WINDOW_OVERLAP；
+    - 单事务整组替换：任一校验失败即回滚，旧管制保持不变。
+    """
+    # 非法区间：止必须大于起（半开区间 [起, 止)）
+    bad = [
+        {"start_minute": c.start_minute, "end_minute": c.end_minute}
+        for c in body.controls if c.end_minute <= c.start_minute
+    ]
+    if bad:
+        raise ApiError(422, "VALIDATION_ERROR",
+                       "非法区间：终点必须大于起点（半开区间 [起, 止)）",
+                       {"bad_intervals": bad})
+
+    # 组内重叠校验（按起点升序后相邻比较；半开区间相邻不算重叠）
+    intervals = sorted(
+        body.controls, key=lambda c: (c.start_minute, c.end_minute)
+    )
+    for prev, cur in zip(intervals, intervals[1:]):
+        if cur.start_minute < prev.end_minute:
+            raise ApiError(
+                422, "CONTROL_WINDOW_OVERLAP",
+                f"管制区间组内重叠: [{prev.start_minute}, {prev.end_minute}) 与 "
+                f"[{cur.start_minute}, {cur.end_minute})",
+                {"overlap": [
+                    {"start_minute": prev.start_minute, "end_minute": prev.end_minute},
+                    {"start_minute": cur.start_minute, "end_minute": cur.end_minute},
+                ]},
+            )
+
+    with get_conn() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # 未知航段：不改动任何数据
+            out = _segment_controls_out(conn, seg_id)
+            # 整组替换（空组即删除全部管制，恢复基础航时）
+            conn.execute(
+                "DELETE FROM segment_controls WHERE seg_id = ?", (seg_id,)
+            )
+            conn.executemany(
+                "INSERT INTO segment_controls"
+                " (seg_id, start_minute, end_minute, travel_time)"
+                " VALUES (?, ?, ?, ?)",
+                [(seg_id, c.start_minute, c.end_minute, c.travel_time)
+                 for c in intervals],
+            )
+            conn.execute("COMMIT")
+        except ApiError:
+            conn.execute("ROLLBACK")
+            raise
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    # 生效清单：按区间起点升序返回
+    out.controls = [ControlWindowOut(**c.model_dump()) for c in intervals]
+    return out
+
+
+@app.get("/api/segments/{seg_id}/controls",
+         response_model=SegmentControlsOut, tags=["segments", "controls"])
+def get_segment_controls(seg_id: int):
+    """查看某航段当前生效的分时航时管制清单（空表示使用基础航时）。"""
+    with get_conn() as conn:
+        return _segment_controls_out(conn, seg_id)
 
 
 # ---- 潮位修订 --------------------------------------------------------------------

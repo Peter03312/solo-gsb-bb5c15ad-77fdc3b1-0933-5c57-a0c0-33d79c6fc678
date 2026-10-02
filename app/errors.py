@@ -18,6 +18,10 @@ def unknown_node(node_id: str) -> ApiError:
     return ApiError(404, "NODE_NOT_FOUND", f"未知节点: {node_id}", {"node_id": node_id})
 
 
+def unknown_segment(seg_id: int) -> ApiError:
+    return ApiError(404, "SEGMENT_NOT_FOUND", f"未知航段: {seg_id}", {"seg_id": seg_id})
+
+
 def tide_missing(missing_minutes) -> ApiError:
     missing = sorted(int(m) for m in missing_minutes)
     shown = missing[:20]

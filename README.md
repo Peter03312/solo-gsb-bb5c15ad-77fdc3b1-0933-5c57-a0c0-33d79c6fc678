@@ -37,6 +37,19 @@
 保存**；通过则一次写入全部不可变快照。同键同内容重试返回原结果（`replayed=true`，
 即使修订已更新），同键异内容 `BATCH_KEY_CONFLICT`。旧单船接口语义完全不变。
 
+**本轮新增分时航时管制**：调度员可按航段维护分时航时管制
+（`PUT /api/segments/{seg_id}/controls`）——以航段编号提交一组**半开分钟区间
+[起, 止)** 及**正整数通行分钟**，单事务**整组替换**该航段旧管制并返回生效清单
+（`GET /api/segments/{seg_id}/controls` 可随时查看）；提交**空组**即恢复基础航时。
+未知航段（`SEGMENT_NOT_FOUND`）、非法区间（止≤起、负分钟、非正通行分钟，
+`VALIDATION_ERROR`）及组内重叠（`CONTROL_WINDOW_OVERLAP`）一律拒绝且**不改旧
+管制**。船在**进入航段的分钟**选定航时：命中某区间即用该区间通行分钟，未命中沿用
+航段基础航时，**途中跨越管制边界也不变**。单船与同修订批次预排均按实际航时计算
+抵达、全程潮位/桥高与航段独占，择优规则不变；确认仍在原事务中用**当时管制**重算，
+变化导致无解或不一致按 `PLAN_MISMATCH` 拒绝且不保存，批次保持全成全败与同键重放。
+**已确认快照的既有占用时长不随管制变化**；潮位复核仍按原快照占用，发生改期时用
+**当前管制**求解。
+
 ---
 
 ## 1. 启动
@@ -124,6 +137,19 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
   - 独占：该 `(航段, 分钟)` 未被其他已确认快照占用
 - **择优**：到达分钟最小；同一到达分钟，按航段编号（`seg_id`，自增）组成的序列做
   字典序比较，序列小者优先（先比较首段编号，相同再比较下一段）。
+- **分时航时管制**：每条航段可设一组**半开分钟区间 [起, 止)** 及区间内**正整数
+  通行分钟**（`PUT /api/segments/{seg_id}/controls` 整组替换、返回生效清单；空组
+  恢复基础航时；`GET /api/segments/{seg_id}/controls` 查看）。未知航段、非法区间
+  （止≤起、负分钟、非正通行分钟）与组内重叠一律拒绝，**失败不改旧管制**。
+  - 船在**进入航段的分钟**选定航时：该分钟命中某区间即用区间通行分钟，未命中沿用
+    航段基础航时；**途中跨越管制边界不改变本次航时**。占用区间仍为
+    `d..d+t-1`（`t` 为进入分钟选定的实际航时），全程按误差带校验潮位/桥高并参与
+    航段独占。
+  - 规划（单船与批次预排）按**当前管制**计算；确认在原事务中用**当时管制**重算，
+    管制变化导致无解或行程不一致按既有 `PLAN_MISMATCH` 拒绝且不保存（批次全成全
+    败、同键重放语义不变）。
+  - **已确认快照的既有占用时长不随管制变化**（占用以快照行程为准）；潮位复核仍按
+    原快照占用分钟判定，发生**改期**时用**当前管制**求解各段实际航时。
 - **潮位修订**：修订号自增、内容不可变，分两种提交方式（均可省略 `base_revision`
   而默认基于**最新**修订；未知基础修订报 `TIDE_REVISION_NOT_FOUND`）：
   - **名义潮位更正** `/api/tide/corrections`：全量继承基础修订的名义潮位与误差，
@@ -209,6 +235,9 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 场景 | HTTP | code |
 | --- | --- | --- |
 | 起点或终点未知 | 404 | `NODE_NOT_FOUND` |
+| 提交/查看管制的航段不存在 | 404 | `SEGMENT_NOT_FOUND` |
+| 管制区间非法（止≤起、负分钟、非正通行分钟） | 422 | `VALIDATION_ERROR` |
+| 管制区间组内重叠（半开区间相邻不算重叠） | 422 | `CONTROL_WINDOW_OVERLAP` |
 | 指定潮位修订不存在 / 复核时目标修订未知 / 误差修订的基础修订未知 | 404 | `TIDE_REVISION_NOT_FOUND` |
 | 复核时行程号未知 | 404 | `TRIP_NOT_FOUND` |
 | 窗口内有分钟缺名义潮位 / 误差修订提交分钟在基础修订无名义潮位 | 422 | `MISSING_TIDE_DATA`（`details` 给出缺失分钟列表与数量） |
@@ -225,21 +254,20 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## 3. HTTP API
 
-> **本轮用法（航段独占占用）**：API 路径与请求/响应结构与上一版完全一致，无需新增
-> 端点——
-> - `POST /api/trips/plan`：规划结果自动避开当时全部已确认快照的占用（**只读，不占位**）；
-> - `POST /api/trips/confirm`：在同一事务内以**最新潮位修订 + 当时占用**重新计算，
->   修订过期沿用 `409 REVISION_STALE`，占用变化导致提交行程不再最优（或窗口内已无
->   可行解）沿用 `409 PLAN_MISMATCH`，冲突均不保存；
-> - `POST /api/trips/{id}/review`：原快照仍只按目标修订的潮位误差带复核；需要改期时，
->   建议避开**其他**已确认快照占用（排除自身），保持原航段顺序与原择优规则，
->   **建议不占位、快照不改写**；窗口内无解沿用 `no_solution=true`。
-> - **本轮新增批次端点**：`POST /api/trips/batch/plan` 按优先顺序预排 2～5 艘船
->   （后船避开已确认占用 + 本批前船拟占用，只读不占位，首个失败序号见
->   `details.ship_index`）；`POST /api/trips/batch/confirm` 在单事务内核订最新修订、
->   逐艘复算逐段比对，`REVISION_STALE` / `PLAN_MISMATCH` 全批不保存，成功凭
->   `idempotency_key` 一次写入全部快照，同键同内容重放原结果、同键异内容
->   `BATCH_KEY_CONFLICT`。
+> **本轮用法（分时航时管制）**：新增航段级管制维护端点，既有接口路径与语义不变——
+> - `PUT /api/segments/{seg_id}/controls`：以一组半开区间 `[起, 止)` + 正整数通行
+>   分钟**整组替换**该航段旧管制，返回生效清单；`{"controls": []}` 恢复基础航时；
+>   未知航段 `404 SEGMENT_NOT_FOUND`、非法区间 `422 VALIDATION_ERROR`、组内重叠
+>   `422 CONTROL_WINDOW_OVERLAP`，失败均不改旧管制；
+> - `GET /api/segments/{seg_id}/controls`：查看该航段当前生效的管制清单；
+> - `POST /api/trips/plan` / `/api/trips/batch/plan`：按**当前管制**在进入分钟选定
+>   各段实际航时（未命中区间用基础航时，途中跨边界不变），抵达、潮位/桥高校验与
+>   航段独占均按实际航时计算，择优规则不变；
+> - `POST /api/trips/confirm` / `/api/trips/batch/confirm`：仍在原事务中用**当时
+>   管制**重算，管制变化导致无解或不一致沿用 `409 PLAN_MISMATCH` 且不保存；批次
+>   全成全败与同键重放（`replayed=true` / `BATCH_KEY_CONFLICT`）不变；
+> - `POST /api/trips/{id}/review`：复核仍按**快照原占用分钟**判定（既有占用时长不
+>   随管制变化）；需要改期时用**当前管制**求解，建议不占位、快照不改写。
 > - 启动方式不变（`docker compose up` / `docker run` / `uvicorn app.main:app`）。
 
 | 方法 | 路径 | 说明 |
@@ -248,6 +276,8 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/nodes` | 节点列表 |
 | POST | `/api/segments` | 录入单向航段 |
 | GET | `/api/segments` | 航段列表（按编号排序） |
+| PUT | `/api/segments/{seg_id}/controls` | **本轮新增**：整组替换航段分时航时管制并返回生效清单（空组恢复基础航时） |
+| GET | `/api/segments/{seg_id}/controls` | **本轮新增**：查看航段当前生效的分时航时管制清单 |
 | GET | `/api/tide/revisions` | 潮位修订列表 |
 | GET | `/api/tide/revisions/{rev}?from_minute=&to_minute=` | 取某修订逐分钟名义潮位 `levels` 与预测误差 `errors` |
 | POST | `/api/tide/corrections` | 名义潮位更正（继承误差），生成新修订 |
@@ -293,6 +323,45 @@ POST /api/tide/error-revisions
 规划/确认/复核携带该修订号时，水深按 `名义−误差`、净空按 `名义+误差` 的保守极值
 核验；确认冲突（`REVISION_STALE`）、择优（最早抵达 + 航段序列字典序）、响应字段
 均与既有规则一致。
+
+### 分时航时管制请求 / 响应示例（本轮新增）
+
+以航段编号提交一组半开区间 `[起, 止)` 及正整数通行分钟，**整组替换**该航段旧管制
+并返回生效清单（按区间起点升序，附航段基础航时）：
+
+```json
+PUT /api/segments/2/controls
+{
+  "controls": [
+    {"start_minute": 0,   "end_minute": 120, "travel_time": 55},
+    {"start_minute": 600, "end_minute": 720, "travel_time": 50}
+  ]
+}
+```
+
+响应 `200`：
+
+```json
+{
+  "seg_id": 2,
+  "origin": "B",
+  "destination": "C",
+  "base_travel_time": 40,
+  "controls": [
+    {"start_minute": 0,   "end_minute": 120, "travel_time": 55},
+    {"start_minute": 600, "end_minute": 720, "travel_time": 50}
+  ]
+}
+```
+
+- 船在**进入航段的分钟**选定航时：于第 30 分钟进入航段 2 -> 命中 `[0,120)`，本次
+  航时 55 分钟（占用 30..84，途中跨越边界 120 也不变）；于第 300 分钟进入 -> 未
+  命中任何区间，沿用基础航时 40 分钟；
+- `{"controls": []}`（或 `{}`）提交空组即删除全部管制、恢复基础航时；
+- 未知航段 `404 SEGMENT_NOT_FOUND`；止≤起 / 负分钟 / 通行分钟非正整数
+  `422 VALIDATION_ERROR`；组内重叠 `422 CONTROL_WINDOW_OVERLAP`（半开区间端点
+  相接不算重叠）；**任一失败均不改旧管制**；
+- `GET /api/segments/2/controls` 随时返回同形的生效清单。
 
 ### 规划请求 / 响应示例
 
@@ -522,6 +591,24 @@ curl -s $BASE/health
 # 查看演示航段
 curl -s $BASE/api/segments
 
+# 0) 本轮新增：航段分时航时管制
+#    航段 2（B->C，基础航时 40）：早高峰 [0,120) 通行 55 分钟，[600,720) 通行 50 分钟
+curl -s -X PUT $BASE/api/segments/2/controls \
+  -H 'Content-Type: application/json' \
+  -d '{"controls":[{"start_minute":0,"end_minute":120,"travel_time":55},
+                   {"start_minute":600,"end_minute":720,"travel_time":50}]}'
+# 查看生效清单
+curl -s $BASE/api/segments/2/controls
+# 空组恢复基础航时
+curl -s -X PUT $BASE/api/segments/2/controls \
+  -H 'Content-Type: application/json' -d '{"controls":[]}'
+# 组内重叠 -> 422 CONTROL_WINDOW_OVERLAP；止<=起 -> 422 VALIDATION_ERROR；
+# 未知航段 -> 404 SEGMENT_NOT_FOUND；失败均不改旧管制
+curl -s -i -X PUT $BASE/api/segments/2/controls \
+  -H 'Content-Type: application/json' \
+  -d '{"controls":[{"start_minute":0,"end_minute":60,"travel_time":50},
+                   {"start_minute":30,"end_minute":90,"travel_time":45}]}' | head -1
+
 # 1) 规划
 curl -s -X POST $BASE/api/trips/plan \
   -H 'Content-Type: application/json' \
@@ -600,6 +687,21 @@ curl -s -X POST $BASE/api/trips/batch/confirm \
 # 同键异内容 -> 409 BATCH_KEY_CONFLICT；修订过期 -> 409 REVISION_STALE
 curl -s -i -X POST $BASE/api/trips/batch/confirm \
   -H 'Content-Type: application/json' -d @/tmp/batch_confirm.json | head -1
+
+# 10) 本轮新增：管制影响规划与确认重算
+# 航段 2 在 [0,120) 通行 55 分钟：进入分钟命中区间 -> 该段航时 55
+curl -s -X PUT $BASE/api/segments/2/controls -H 'Content-Type: application/json' \
+  -d '{"controls":[{"start_minute":0,"end_minute":120,"travel_time":55}]}'
+curl -s -X POST $BASE/api/trips/plan -H 'Content-Type: application/json' \
+  -d '{"origin":"A","destination":"D","start_minute":0,"window_minutes":1440,
+       "draft":5.0,"height":2.0,"margin":0.5,"revision":1}' > /tmp/plan_ctl.json
+# /tmp/plan_ctl.json 中航段 2 的 travel_time 为 55（30 进入、85 抵达）
+# 若手上仍是管制前的旧规划（航时 40），确认时按当时管制重算 -> 409 PLAN_MISMATCH
+curl -s -X POST $BASE/api/trips/confirm -H 'Content-Type: application/json' \
+  -d @/tmp/plan_ctl.json     # 用当前管制下的新规划确认 -> 201
+# 已确认快照的占用时长不随管制变化：删除管制后，快照占用仍按确认时的 55 分钟计
+curl -s -X PUT $BASE/api/segments/2/controls -H 'Content-Type: application/json' \
+  -d '{"controls":[]}'
 ```
 
 Python 示例（规划 → 确认 → 更正 → 复核/改期）：
@@ -675,6 +777,38 @@ retry = requests.post(f"{B}/api/trips/batch/confirm", json=confirm_body)
 assert retry.status_code == 200 and retry.json()["replayed"] is True
 ```
 
+Python 示例（分时航时管制：提交 → 规划按实际航时 → 确认重算）：
+
+```python
+import requests
+
+B = "http://localhost:8000"
+
+# 1) 航段 2（B->C，基础航时 40）早高峰 [0,120) 通行 55 分钟（整组替换）
+r = requests.put(f"{B}/api/segments/2/controls", json={
+    "controls": [{"start_minute": 0, "end_minute": 120, "travel_time": 55}],
+})
+print("生效清单:", r.json()["controls"])
+
+# 2) 规划：30 分进入航段 2，命中管制 -> 该段航时 55（途中跨边界不变）
+plan = requests.post(f"{B}/api/trips/plan", json={
+    "origin": "A", "destination": "D",
+    "start_minute": 0, "window_minutes": 1440,
+    "draft": 5.0, "height": 2.0, "margin": 0.5,
+}).json()
+print([(l["seg_id"], l["start_minute"], l["travel_time"]) for l in plan["itinerary"]])
+
+# 3) 确认：原事务中用当时管制重算，一致才保存
+trip = requests.post(f"{B}/api/trips/confirm", json=plan)
+print("确认:", trip.status_code)   # 201
+
+# 4) 管制再变后，旧规划去确认 -> 409 PLAN_MISMATCH；空组恢复基础航时
+requests.put(f"{B}/api/segments/2/controls", json={"controls": []})
+again = requests.post(f"{B}/api/trips/confirm", json=plan)
+print("管制变化后确认旧规划:", again.status_code,
+      again.json()["error"]["code"])   # 409 PLAN_MISMATCH
+```
+
 录入自定义数据：
 
 ```bash
@@ -691,16 +825,19 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 
 1. 校验节点与修订；取窗口内全部名义潮位与预测误差，任一分钟缺名义潮位立即报
    `MISSING_TIDE_DATA`；同时读取窗口内全部已确认快照的航段占用
-   （`load_occupancy`，既有快照彼此重叠也原样计入）；
-2. 对每条航段用"不可行分钟前缀和"预处理：任意进入分钟对应的占用区间是否全程满足
-   误差带约束（水深 `深度+名义−误差`、净空 `净空−名义−误差`）**且无任何一分钟被
-   其他已确认快照占用**，查询为 O(1)；
+   （`load_occupancy`，既有快照彼此重叠也原样计入）与全部航段的**分时航时管制**
+   （`_load_controls`）；
+2. 对每条航段用"不可行分钟前缀和"预处理：进入分钟 `d` 的航时 `t(d)` 由**当前管制**
+   选定（命中区间用区间通行分钟，否则用基础航时），其占用区间 `d..d+t(d)-1` 是否
+   全程满足误差带约束（水深 `深度+名义−误差`、净空 `净空−名义−误差`）**且无任何
+   一分钟被其他已确认快照占用**，查询为 O(1)；
 3. 状态 `(节点, 分钟)` 只保留一个值：到达该状态的航段编号序列中**字典序最小**者。
    转移有两种：
    - 等待：同一节点序列不变推进到下一分钟；
-   - 出发：在该节点的整分钟进入可行航段，序列追加该航段编号；
+   - 出发：在该节点的整分钟进入可行航段（航时按进入分钟确定，途中跨边界不变），
+     序列追加该航段编号；
 4. 按分钟递增处理，终点第一次出现的分钟即最早抵达，其序列即同到达时刻字典序最优；
-5. 回溯父指针，输出每段的进入/抵达分钟。
+5. 回溯父指针，输出每段的进入/抵达分钟与实际航时。
 
 剪枝依据：若序列 `s1 < s2`（字典序），则对任意后缀 `x` 恒有 `s1+x < s2+x`，
 故同一 `(节点, 分钟)` 只需保留最小序列，不会丢失最优解。复杂度 O(W·E)（W≤1440）。
@@ -739,8 +876,10 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
    抵达该段终点」，每状态只保留一个最优代价
    `(相对快照的出发分钟变动段数, 各段出发分钟序列)`（字典序）。可行表复用规划的
    不可行分钟前缀和，每分钟的不可行原因同时包含误差带违规与**他船占用**（本快照自身
-   已排除）；第 i 段用「抵达分钟 ≤ 当前出发分钟」的逐分钟最优前缀扫描（等待由前缀
-   隐式表达），命中可行进入分钟即追加该段出发分钟，单次判定 O(1)。
+   已排除）；各段航时按**当前分时管制**在进入分钟选定（未命中区间用基础航时；不同
+   出发分钟可能抵达同一分钟，同一 `(i+1, 抵达分钟)` 保留字典序最小代价）；第 i 段用
+   「抵达分钟 ≤ 当前出发分钟」的逐分钟最优前缀扫描（等待由前缀隐式表达），命中可行
+   进入分钟即追加该段出发分钟，单次判定 O(1)。
 4. 终态在全部抵达分钟上取 `(变动段数, 抵达分钟, 出发分钟序列)` 字典序最小者；无终态
    即 `no_solution`。复杂度 O(k·W)，且全程不写库。
 
@@ -755,14 +894,14 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 ```
 app/
   config.py             # 环境变量配置
-  database.py           # SQLite 连接、建表、演示数据初始化
-  errors.py             # 统一业务错误（含 trip_not_found 构造器）
-  schemas.py            # Pydantic 模型与入参校验（窗口<=1440、航时>0 等）
-  services/planning.py  # 潮汐约束与时间展开 DP 规划算法
+  database.py           # SQLite 连接、建表（含 segment_controls 管制表）、演示数据初始化
+  errors.py             # 统一业务错误（含 trip_not_found / unknown_segment 构造器）
+  schemas.py            # Pydantic 模型与入参校验（窗口<=1440、航时>0、管制区间界限等）
+  services/planning.py  # 潮汐约束、分时管制航时选定与时间展开 DP 规划算法
   services/batch.py     # 同修订批次预排/确认（逐艘串行规划 + 事务复算 + 幂等键）
-  services/reschedule.py# 更正后原行程复核与改期 DP（只读）
-  main.py               # FastAPI 路由（节点/航段/潮位更正与误差修订/单船与批次规划确认/复核改期）
-tests/                  # pytest 测试（85 个，含择优、缺潮位、事务冲突、误差带、复核改期、航段占用、批次预排/确认/幂等等）
+  services/reschedule.py# 更正后原行程复核与改期 DP（只读；改期按当前管制求航时）
+  main.py               # FastAPI 路由（节点/航段/分时管制/潮位更正与误差修订/单船与批次规划确认/复核改期）
+tests/                  # pytest 测试（100 个，含择优、缺潮位、事务冲突、误差带、复核改期、航段占用、批次预排/确认/幂等、分时航时管制等）
 Dockerfile
 docker-compose.yml
 requirements.txt

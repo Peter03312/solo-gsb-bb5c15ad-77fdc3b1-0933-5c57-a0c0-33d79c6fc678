@@ -1,7 +1,7 @@
 """Pydantic 请求 / 响应模型。"""
 from typing import Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 from . import config
 
@@ -35,6 +35,41 @@ class SegmentOut(BaseModel):
     travel_time: int
     depth: float
     clearance: Optional[float] = None
+
+
+# ---- 航段分时航时管制 -------------------------------------------------------------
+
+class ControlWindowIn(BaseModel):
+    """一条分时航时管制：半开区间 [start_minute, end_minute) 内的通行航时。
+
+    「止 > 起」由端点校验（与 corrections 的分钟校验同口径），其余简单
+    上下界由字段约束给出。
+    """
+    start_minute: int = Field(ge=0, description="管制区间起点（含，绝对分钟，>=0）")
+    end_minute: int = Field(ge=0, description="管制区间终点（不含，绝对分钟）")
+    travel_time: int = Field(gt=0, description="区间内通行航时（正整数分钟）")
+
+
+class SegmentControlsIn(BaseModel):
+    controls: list[ControlWindowIn] = Field(
+        default_factory=list,
+        description="整组替换的分时管制区间（组内不得重叠）；空列表表示恢复基础航时",
+    )
+
+
+class ControlWindowOut(BaseModel):
+    start_minute: int
+    end_minute: int
+    travel_time: int
+
+
+class SegmentControlsOut(BaseModel):
+    """某航段当前生效的管制清单（按区间起点升序）。"""
+    seg_id: int
+    origin: str
+    destination: str
+    base_travel_time: int = Field(description="航段基础航时（未命中管制区间时沿用）")
+    controls: list[ControlWindowOut]
 
 
 # ---- 潮位 ----------------------------------------------------------------------

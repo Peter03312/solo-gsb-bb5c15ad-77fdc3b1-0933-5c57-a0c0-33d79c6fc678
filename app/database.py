@@ -54,6 +54,15 @@ CREATE TABLE IF NOT EXISTS confirmed_trips (
     confirmed_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS segment_controls (
+    seg_id       INTEGER NOT NULL REFERENCES segments(seg_id),
+    start_minute INTEGER NOT NULL CHECK (start_minute >= 0),  -- 半开区间起点（含，绝对分钟）
+    end_minute   INTEGER NOT NULL,                            -- 半开区间终点（不含）
+    travel_time  INTEGER NOT NULL CHECK (travel_time > 0),    -- 区间内通行航时（正整数分钟）
+    PRIMARY KEY (seg_id, start_minute),
+    CHECK (end_minute > start_minute)
+);
+
 CREATE TABLE IF NOT EXISTS batch_confirmations (
     idempotency_key TEXT PRIMARY KEY,                      -- 批次幂等键
     revision        INTEGER NOT NULL,                       -- 批次所据修订号

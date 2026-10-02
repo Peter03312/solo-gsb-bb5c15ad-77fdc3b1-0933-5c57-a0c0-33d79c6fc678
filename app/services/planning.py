@@ -11,6 +11,11 @@ d, d+1, ..., d+t-1，于 d+t 抵达下一节点）。
     分钟 d 至抵达前一分钟 d+t-1 独占该航段；节点等待不占用航段）
 等待不占用航段，不参与校验。
 
+分时航时管制：每条航段可设一组半开分钟区间 [起, 止) 及区间内通行航时。
+船在**进入航段的分钟**选定航时——命中某区间即用该区间航时，未命中沿用
+航段基础航时；途中跨越管制边界不改变本次航时。已确认快照的占用时长以
+快照为准，不随后续管制变化。
+
 择优：最早抵达；同一抵达时刻按航段编号序列字典序（小者优先）。
 算法：窗口 <= 1440 分钟，按时间展开 DP，每个 (节点, 分钟) 只保留字典序
 最小的航段编号序列。该性质可安全剪枝——任何延续在相同状态上叠加后，
@@ -46,6 +51,32 @@ def _load_segments(conn) -> dict[int, Segment]:
         )
         for r in rows
     }
+
+
+def _load_controls(conn) -> dict[int, list[tuple[int, int, int]]]:
+    """读取全部航段的分时航时管制：{seg_id: [(起, 止, 通行分钟), ...]}（按起点升序）。"""
+    rows = conn.execute(
+        "SELECT seg_id, start_minute, end_minute, travel_time"
+        " FROM segment_controls ORDER BY seg_id, start_minute"
+    ).fetchall()
+    controls: dict[int, list[tuple[int, int, int]]] = {}
+    for r in rows:
+        controls.setdefault(r["seg_id"], []).append(
+            (r["start_minute"], r["end_minute"], r["travel_time"])
+        )
+    return controls
+
+
+def travel_time_at(seg: Segment, seg_controls, minute: int) -> int:
+    """进入分钟 minute 的航时：命中管制区间用区间航时，否则用航段基础航时。
+
+    航时由进入分钟唯一确定；途中跨越管制边界不改变本次航时。
+    seg_controls 为该航段的 [(起, 止, 通行分钟), ...]（组内不重叠）。
+    """
+    for s, e, t in seg_controls:
+        if s <= minute < e:
+            return t
+    return seg.travel_time
 
 
 def _load_tide(conn, revision: int, lo: int, hi: int) -> dict[int, tuple[float, float]]:
@@ -106,19 +137,22 @@ def _build_departure_feasible(
     height: float,
     margin: float,
     blocked: Optional[dict[int, set[int]]] = None,
+    controls: Optional[dict[int, list[tuple[int, int, int]]]] = None,
 ) -> dict[int, list[bool]]:
     """每条航段每个可能进入分钟（窗口内局部下标）是否可行。
 
     不可行原因有二：潮位误差带不满足水深/净空，或该占用区间与其他已确认
     行程的占用（blocked：{seg_id: {绝对分钟}}）重叠。用"不可行分钟"前缀
-    和，令一次区间查询为 O(1)。
+    和，令一次区间查询为 O(1)。航时按进入分钟由 controls 选定（未命中
+    区间用基础航时），占用区间为 [d, d+t(d)-1]。
     """
     blocked = blocked or {}
+    controls = controls or {}
     feasible: dict[int, list[bool]] = {}
-    horizon = start + window
 
     for seg in segs:
         seg_blocked = blocked.get(seg.seg_id, ())
+        seg_controls = controls.get(seg.seg_id, ())
         # bad[i] 对应绝对分钟 start+i
         bad = [0] * window
         for i in range(window):
@@ -133,10 +167,9 @@ def _build_departure_feasible(
             pref[i + 1] = pref[i] + bad[i]
 
         ok = [False] * (window + 1)  # 局部下标 d-start，0..window
-        t = seg.travel_time
-        for i in range(0, window - t + 1):
-            dep = start + i
-            if dep + t > horizon:
+        for i in range(window):
+            t = travel_time_at(seg, seg_controls, start + i)
+            if i + t > window:  # 抵达越出窗口（占用分钟最晚到 start+window-1）
                 continue
             if pref[i + t] - pref[i] == 0:
                 ok[i] = True
@@ -216,9 +249,12 @@ def find_itinerary(
     for s in seg_list:
         out_segs.setdefault(s.origin, []).append(s)
 
+    # 分时航时管制：进入分钟命中区间即用区间航时，否则用基础航时
+    controls = _load_controls(conn)
+
     feasible = _build_departure_feasible(
         seg_list, tide, start_minute, window_minutes, draft, height, margin,
-        blocked=blocked,
+        blocked=blocked, controls=controls,
     )
 
     # 5) 按分钟展开的 DP
@@ -246,7 +282,8 @@ def find_itinerary(
         # 5.3 从本分钟出发的航段（船恰好在节点上即可出发，等待后亦可）
         for v, seq in states[i].items():
             for s in out_segs.get(v, []):
-                t = s.travel_time
+                # 航时按进入分钟选定；途中跨越管制边界不变
+                t = travel_time_at(s, controls.get(s.seg_id, ()), start_minute + i)
                 j = i + t
                 if j > n:
                     continue
@@ -279,7 +316,8 @@ def find_itinerary(
             "destination": segs[sid].destination,
             "start_minute": start_minute + pi,
             "end_minute": start_minute + ai,
-            "travel_time": segs[sid].travel_time,
+            # 实际航时（进入分钟选定的管制航时或基础航时）
+            "travel_time": ai - pi,
         }
         for sid, pi, ai in legs
     ]
